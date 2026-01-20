@@ -116,9 +116,11 @@ function M.parse_line(line)
     return nil, nil, 0
   end
 
-  -- Count leading spaces and calculate indent level (2 spaces = 1 level, max 1)
-  local leading_spaces = line:match("^(%s*)") or ""
-  local indent_level = math.min(math.floor(#leading_spaces / 2), 1)
+  -- Count leading whitespace and calculate indent level (2 spaces or 1 tab = 1 level, max 1)
+  local leading_ws = line:match("^(%s*)") or ""
+  -- Expand tabs to 2 spaces for calculation
+  local expanded_ws = leading_ws:gsub("\t", "  ")
+  local indent_level = math.min(math.floor(#expanded_ws / 2), 1)
 
   -- Strip leading whitespace for parsing
   local stripped = line:gsub("^%s+", "")
@@ -127,14 +129,32 @@ function M.parse_line(line)
   local id, rest = stripped:match("^/([^%s]+) %- (.*)$")
 
   if not id then
-    -- No ID prefix - treat as new task (plain text)
-    local title = stripped:match("^(.-)%s*$")
-    if title and title ~= "" then
-      return nil, {
-        title = title,
-        status = "needsAction",
-        due = nil,
-      }, indent_level
+    -- No ID prefix - treat as new task
+    -- Try to parse checkbox: [x] or [ ] followed by optional date and title
+    local status_char, after_checkbox = stripped:match("^%[([%sx])%]%s+(.*)$")
+    if status_char then
+      -- Found checkbox, try to parse date
+      local date_str, title = after_checkbox:match("^(%d%d%d%d%-%d%d%-%d%d)%s+(.*)$")
+      if not date_str then
+        title = after_checkbox
+      end
+      if title and title ~= "" then
+        return nil, {
+          title = title,
+          status = status_char == "x" and "completed" or "needsAction",
+          due = date_str,
+        }, indent_level
+      end
+    else
+      -- No checkbox, treat entire stripped text as title
+      local title = stripped:match("^(.-)%s*$")
+      if title and title ~= "" then
+        return nil, {
+          title = title,
+          status = "needsAction",
+          due = nil,
+        }, indent_level
+      end
     end
     return nil, nil, 0
   end
@@ -404,8 +424,9 @@ function M.update_line(id, task)
     local line_id = line:match("^%s*/([^%s]+) %-")
     if line_id == id then
       -- Preserve the indent level from the existing line
-      local leading_spaces = line:match("^(%s*)") or ""
-      local indent_level = math.min(math.floor(#leading_spaces / 2), 1)
+      local leading_ws = line:match("^(%s*)") or ""
+      local expanded_ws = leading_ws:gsub("\t", "  ")
+      local indent_level = math.min(math.floor(#expanded_ws / 2), 1)
       local new_line = format_task_line(id, task, indent_level)
       vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { new_line })
       M.apply_extmarks()
@@ -413,9 +434,41 @@ function M.update_line(id, task)
     end
   end
 
-  -- ID not found, append as new line (at root level, or under parent if specified)
+  -- ID not found - insert in correct position
   local indent_level = task.parent and 1 or 0
   local new_line = format_task_line(id, task, indent_level)
+
+  if task.parent then
+    -- Find parent's line and insert after it (and after any existing children)
+    local insert_after = nil
+    for i, line in ipairs(lines) do
+      local line_id = line:match("^%s*/([^%s]+) %-")
+      if line_id == task.parent then
+        -- Found parent, start tracking insertion point
+        insert_after = i
+      elseif insert_after then
+        -- We're past the parent, check if this is still a child (indented)
+        local leading_ws = line:match("^(%s*)") or ""
+        local expanded_ws = leading_ws:gsub("\t", "  ")
+        local line_indent = math.floor(#expanded_ws / 2)
+        if line_indent > 0 then
+          -- Still a child, update insertion point
+          insert_after = i
+        else
+          -- Found next root task, stop here
+          break
+        end
+      end
+    end
+
+    if insert_after then
+      vim.api.nvim_buf_set_lines(buf, insert_after, insert_after, false, { new_line })
+      M.apply_extmarks()
+      return
+    end
+  end
+
+  -- Fallback: append at end
   vim.api.nvim_buf_set_lines(buf, -1, -1, false, { new_line })
   M.apply_extmarks()
 end

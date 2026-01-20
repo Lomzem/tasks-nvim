@@ -60,19 +60,23 @@ function M.fetch_and_merge(callback)
         cache.set_task(id, remote_internal)
         changed = true
       elseif local_task.hidden then
-        -- We soft-deleted it locally, check if remote was updated after
+        -- We soft-deleted it locally - DO NOT restore it
+        -- The deletion is in progress or will be retried on purge
+        -- Only restore if remote was updated AFTER we hid it (meaning someone else edited it)
         if local_task.hidden_at and remote_task.updated then
           local hidden_ts = util.parse_iso8601(local_task.hidden_at)
           local remote_ts = util.parse_iso8601(remote_task.updated)
 
-          if hidden_ts and remote_ts and remote_ts > hidden_ts then
-            -- Remote was updated after we hid it, restore
+          -- Only restore if remote update is significantly after hidden_at (> 5 seconds)
+          -- This prevents race conditions where we just hid it but haven't deleted yet
+          if hidden_ts and remote_ts and (remote_ts - hidden_ts) > 5 then
+            -- Remote was meaningfully updated after we hid it, restore
             remote_internal.hidden = false
             remote_internal.hidden_at = nil
             cache.set_task(id, remote_internal)
             changed = true
           end
-          -- else: keep hidden
+          -- else: keep hidden, our delete is in progress
         end
       elseif local_task.local_modified then
         -- We have local changes, check timestamps for conflict resolution
@@ -80,8 +84,7 @@ function M.fetch_and_merge(callback)
         local remote_ts = util.parse_iso8601(remote_task.updated)
 
         if local_ts and remote_ts and remote_ts > local_ts then
-          -- Remote is newer, overwrite local (but preserve local_modified to push our changes)
-          -- Actually, remote wins means we discard local changes
+          -- Remote is newer, overwrite local
           cache.set_task(id, remote_internal)
           changed = true
         end
@@ -200,10 +203,19 @@ end
 --- Handle buffer save: parse changes, update cache, push to remote
 function M.on_buffer_save()
   local parsed, new_tasks = buffer.parse()
-  local current_cache = cache.get_all_tasks()
+  
+  -- IMPORTANT: Take a snapshot of current cache IDs before modifying
+  -- We need this because cache.get_all_tasks() returns a reference
+  local existing_ids = {}
+  for id, _ in pairs(cache.get_all_tasks()) do
+    existing_ids[id] = true
+  end
 
   -- Track which cached IDs are still in the buffer
   local seen_ids = {}
+
+  -- Track tasks to delete
+  local to_delete = {}
 
   -- Process existing tasks (those with IDs)
   for id, buffer_task in pairs(parsed) do
@@ -245,10 +257,20 @@ function M.on_buffer_save()
     })
   end
 
-  -- Mark tasks not in buffer as hidden (soft delete)
-  for id, task in pairs(current_cache) do
-    if not task.hidden and not seen_ids[id] and not cache.is_new_id(id) then
-      cache.mark_hidden(id)
+  -- Find tasks to delete (not in buffer anymore)
+  -- Only check IDs that existed BEFORE we added new tasks
+  for id, _ in pairs(existing_ids) do
+    local task = cache.get_task(id)
+    if task and not task.hidden and not seen_ids[id] then
+      -- Task was deleted from buffer
+      if cache.is_new_id(id) then
+        -- New task that was never synced, just remove from cache
+        cache.delete_task(id)
+      else
+        -- Mark as hidden and queue for deletion
+        cache.mark_hidden(id)
+        table.insert(to_delete, id)
+      end
     end
   end
 
@@ -264,6 +286,20 @@ function M.on_buffer_save()
       vim.notify("tasks-nvim: Failed to sync some changes: " .. (err or "unknown"), vim.log.levels.WARN)
     end
   end)
+
+  -- Delete tasks from remote (async)
+  for _, id in ipairs(to_delete) do
+    api.delete_task(id, function(success, _, err)
+      if success then
+        -- Successfully deleted from remote, remove from cache entirely
+        cache.delete_task(id)
+        cache.save()
+      else
+        vim.notify("tasks-nvim: Failed to delete task: " .. (err or "unknown"), vim.log.levels.WARN)
+        -- Keep it hidden in cache, will retry on next purge
+      end
+    end)
+  end
 end
 
 --- Purge hidden tasks older than the threshold

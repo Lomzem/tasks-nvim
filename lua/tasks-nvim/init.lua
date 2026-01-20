@@ -6,11 +6,24 @@ local buffer = nil
 local cache = nil
 local sync = nil
 
+-- Configuration with defaults
+M.config = {
+  client_id = nil,
+  client_secret = nil,
+  purge_after_days = 30,
+  -- Keybindings (set to false to disable)
+  keys = {
+    toggle = "<CR>", -- Toggle task completion
+  },
+}
+
 --- Setup the plugin with configuration
 ---@param opts table Configuration options
 ---  - client_id: string (required) Google OAuth client ID
 ---  - client_secret: string (required) Google OAuth client secret
 ---  - purge_after_days: number (optional) Days before hidden tasks are purged (default: 30)
+---  - keys: table (optional) Keybinding configuration
+---    - toggle: string|false (optional) Key to toggle completion (default: "<CR>", false to disable)
 function M.setup(opts)
   opts = opts or {}
 
@@ -25,18 +38,25 @@ function M.setup(opts)
     return
   end
 
+  -- Merge user config with defaults
+  M.config = vim.tbl_deep_extend("force", M.config, opts)
+
   -- Load modules
   auth = require("tasks-nvim.auth")
   sync = require("tasks-nvim.sync")
+  buffer = require("tasks-nvim.buffer")
 
   -- Configure auth module
-  auth.client_id = opts.client_id
-  auth.client_secret = opts.client_secret
+  auth.client_id = M.config.client_id
+  auth.client_secret = M.config.client_secret
 
   -- Configure sync module
-  if opts.purge_after_days then
-    sync.purge_after_days = opts.purge_after_days
-  end
+  sync.purge_after_days = M.config.purge_after_days
+
+  -- Configure buffer module
+  buffer.config = {
+    keys = M.config.keys,
+  }
 
   -- Create user commands
   vim.api.nvim_create_user_command("Tasks", function()

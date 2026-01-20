@@ -9,8 +9,12 @@ A Neovim plugin for managing Google Tasks via an oil.nvim-style buffer. Uses **S
 - Last-Write-Wins conflict resolution per-task
 - Soft-delete with 30-day purge (deleted tasks are hidden, not removed)
 - Buffer updates immediately when background sync finds changes
-- Filetype is `markdown` (user can add their own highlighting plugins)
+- Custom checkbox rendering with extmarks (no external dependencies for UI)
 - Errors via `vim.notify`
+
+## Dependencies
+
+- [plenary.nvim](https://github.com/nvim-lua/plenary.nvim) - HTTP requests, async operations
 
 ---
 
@@ -21,13 +25,10 @@ lua/tasks-nvim/
 ├── init.lua           # setup(), user commands
 ├── auth.lua           # OAuth flow, token storage/refresh
 ├── api.lua            # Google Tasks API wrapper
-├── buffer.lua         # Buffer rendering, parsing, autocmds
+├── buffer.lua         # Buffer rendering, parsing, autocmds, extmarks
 ├── cache.lua          # Task cache, file I/O
 ├── sync.lua           # SWR logic, conflict resolution
 └── util.lua           # Date parsing helpers
-
-syntax/
-└── tasks.vim          # Concealment pattern for task IDs
 ```
 
 ---
@@ -106,22 +107,35 @@ M.render(tasks)             -- Render tasks to buffer
 M.parse()                   -- Parse buffer → list of tasks
 M.update_line(id, task)     -- Update specific line (for live sync)
 M.get_bufnr()               -- Get task buffer number (or nil)
+M.apply_extmarks()          -- Apply extmarks for rendering
 ```
 
 **Buffer setup:**
 - `buftype = "acwrite"` (allows custom save handling)
-- `filetype = "markdown"`
+- `filetype = "tasks"` (custom filetype)
 - Window options: `conceallevel = 3`, `concealcursor = "nvic"`
 
 **Line format:**
 ```
-/GOOGLE_ID_HERE - [ ] 2024-01-18 Task title
-/new:1 - [ ] New unsaved task
+/GOOGLE_ID_HERE - [x] 2024-01-18 Task title
+/new:1 - [ ] New unsaved task (no date)
+```
+
+**Extmarks rendering:**
+- `/ID - ` prefix is concealed
+- `[x]` and `[ ]` are replaced with icons (󰱒 and 󰄱)
+- Dates are highlighted with `Special` highlight group
+
+User sees:
+```
+󰱒  2024-01-18 Task title
+󰄱  New unsaved task
 ```
 
 **Autocmds:**
 - `BufWriteCmd` → Parse buffer, queue sync, mark as saved
-- `TextYankPost` → Strip `/ID ` prefix from yanked text
+- `TextYankPost` → Strip `/ID - ` prefix from yanked text
+- `TextChanged` / `InsertLeave` → Reapply extmarks
 
 **Parsing logic:**
 ```lua
@@ -227,20 +241,6 @@ M.now_iso8601()             -- current time as ISO string
 
 ---
 
-### 8. `syntax/tasks.vim`
-
-```vim
-if exists("b:current_syntax")
-  finish
-endif
-
-syn match tasksId /^\/[^ ]* / conceal
-
-let b:current_syntax = "tasks"
-```
-
----
-
 ## Implementation Order
 
 | Phase | Module | Description |
@@ -250,6 +250,5 @@ let b:current_syntax = "tasks"
 | 3 | `auth.lua` | OAuth flow, token management |
 | 4 | `api.lua` | Google Tasks API wrapper |
 | 5 | `buffer.lua` | Rendering, parsing, autocmds |
-| 6 | `syntax/tasks.vim` | Concealment |
-| 7 | `sync.lua` | SWR, merge, push logic |
-| 8 | `init.lua` | Wire everything together |
+| 6 | `sync.lua` | SWR, merge, push logic |
+| 7 | `init.lua` | Wire everything together |

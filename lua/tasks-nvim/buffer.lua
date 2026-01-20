@@ -17,8 +17,8 @@ M.config = {
 }
 
 --- Calculate the minimum column position (after the concealed prefix)
---- Format: /ID - [x] YYYY-MM-DD Title
---- The prefix /ID - [x] is concealed/rendered, user edits from date/title onwards
+--- Format: [indent]/ID - [x] YYYY-MM-DD Title
+--- The prefix [indent]/ID - [x] is concealed/rendered, user edits from date/title onwards
 ---@param line string The buffer line
 ---@return number min_col The 0-indexed column where editable content starts
 local function get_editable_start_col(line)
@@ -26,16 +26,20 @@ local function get_editable_start_col(line)
     return 0
   end
 
-  -- Match: /ID - [x] (with trailing space)
-  local prefix = line:match("^(/[^%s]+ %- %[[x ]%] )")
+  -- Count leading spaces (indent)
+  local leading_spaces = line:match("^(%s*)") or ""
+  local indent_len = #leading_spaces
+
+  -- Match: /ID - [x] (with trailing space), after any indent
+  local prefix = line:match("^%s*(/[^%s]+ %- %[[x ]%] )")
   if prefix then
-    return #prefix
+    return indent_len + #prefix
   end
 
   -- Fallback: just /ID -
-  local id_prefix = line:match("^(/[^%s]+ %- )")
+  local id_prefix = line:match("^%s*(/[^%s]+ %- )")
   if id_prefix then
-    return #id_prefix
+    return indent_len + #id_prefix
   end
 
   return 0
@@ -79,13 +83,15 @@ function M.get_bufnr()
 end
 
 --- Format a single task as a buffer line
---- Format: /ID - [x] YYYY-MM-DD Title  or  /ID - [ ] Title
+--- Format: [indent]/ID - [x] YYYY-MM-DD Title  or  /ID - [ ] Title
 ---@param id string Task ID
 ---@param task table Task data
+---@param indent_level number|nil Indent level (0 or 1, defaults to 0)
 ---@return string line
-local function format_task_line(id, task)
+local function format_task_line(id, task, indent_level)
   local status_char = task.status == "completed" and "x" or " "
   local due_part = ""
+  local indent = string.rep("  ", indent_level or 0)
 
   if task.due then
     -- Extract just the date part if it's a full ISO timestamp
@@ -95,34 +101,42 @@ local function format_task_line(id, task)
     end
   end
 
-  return string.format("/%s - [%s] %s%s", id, status_char, due_part, task.title or "")
+  return string.format("%s/%s - [%s] %s%s", indent, id, status_char, due_part, task.title or "")
 end
 
 --- Parse a single buffer line into task data
---- Format: /ID - [x] YYYY-MM-DD Title  or  /ID - [ ] Title  or  plain text (new task)
+--- Format: [indent]/ID - [x] YYYY-MM-DD Title  or  /ID - [ ] Title  or  plain text (new task)
 ---@param line string Buffer line
 ---@return string|nil id Task ID (or nil if line is invalid/empty or new task)
 ---@return table|nil task Task data
+---@return number indent_level Indent level (0 or 1)
 function M.parse_line(line)
   -- Skip empty lines
   if not line or line:match("^%s*$") then
-    return nil, nil
+    return nil, nil, 0
   end
 
+  -- Count leading spaces and calculate indent level (2 spaces = 1 level, max 1)
+  local leading_spaces = line:match("^(%s*)") or ""
+  local indent_level = math.min(math.floor(#leading_spaces / 2), 1)
+
+  -- Strip leading whitespace for parsing
+  local stripped = line:gsub("^%s+", "")
+
   -- Try to extract ID: /ID - ...
-  local id, rest = line:match("^/([^%s]+) %- (.*)$")
+  local id, rest = stripped:match("^/([^%s]+) %- (.*)$")
 
   if not id then
     -- No ID prefix - treat as new task (plain text)
-    local title = line:match("^%s*(.-)%s*$")
+    local title = stripped:match("^(.-)%s*$")
     if title and title ~= "" then
       return nil, {
         title = title,
         status = "needsAction",
         due = nil,
-      }
+      }, indent_level
     end
-    return nil, nil
+    return nil, nil, 0
   end
 
   -- Parse checkbox: [x] or [ ]
@@ -134,7 +148,7 @@ function M.parse_line(line)
       title = rest,
       status = "needsAction",
       due = nil,
-    }
+    }, indent_level
   end
 
   -- Parse date and title from after_checkbox
@@ -145,7 +159,7 @@ function M.parse_line(line)
   end
 
   if not title or title == "" then
-    return nil, nil
+    return nil, nil, 0
   end
 
   local task = {
@@ -154,7 +168,36 @@ function M.parse_line(line)
     due = date_str,
   }
 
-  return id, task
+  return id, task, indent_level
+end
+
+--- Sort function for tasks: incomplete first (by due date), then completed
+---@param a table { id = string, task = table }
+---@param b table { id = string, task = table }
+---@return boolean
+local function task_sort_fn(a, b)
+  -- Incomplete tasks come before completed
+  local a_completed = a.task.status == "completed"
+  local b_completed = b.task.status == "completed"
+
+  if a_completed ~= b_completed then
+    return not a_completed
+  end
+
+  -- Within same completion status, sort by due date (earliest first, nil last)
+  local a_due = a.task.due
+  local b_due = b.task.due
+
+  if a_due and b_due then
+    return a_due < b_due
+  elseif a_due then
+    return true
+  elseif b_due then
+    return false
+  end
+
+  -- Fall back to title
+  return (a.task.title or "") < (b.task.title or "")
 end
 
 --- Render tasks to the buffer
@@ -165,41 +208,62 @@ function M.render(tasks)
     return
   end
 
-  -- Sort tasks: incomplete first (by due date), then completed
-  local sorted = {}
+  -- Separate root tasks from subtasks
+  local root_tasks = {}
+  local children_by_parent = {}
+
   for id, task in pairs(tasks) do
-    table.insert(sorted, { id = id, task = task })
+    if task.parent then
+      -- Subtask
+      if not children_by_parent[task.parent] then
+        children_by_parent[task.parent] = {}
+      end
+      table.insert(children_by_parent[task.parent], { id = id, task = task })
+    else
+      -- Root task
+      table.insert(root_tasks, { id = id, task = task })
+    end
   end
 
-  table.sort(sorted, function(a, b)
-    -- Incomplete tasks come before completed
-    local a_completed = a.task.status == "completed"
-    local b_completed = b.task.status == "completed"
+  -- Sort root tasks
+  table.sort(root_tasks, task_sort_fn)
 
-    if a_completed ~= b_completed then
-      return not a_completed
-    end
+  -- Sort children within each parent
+  for _, children in pairs(children_by_parent) do
+    table.sort(children, task_sort_fn)
+  end
 
-    -- Within same completion status, sort by due date (earliest first, nil last)
-    local a_due = a.task.due
-    local b_due = b.task.due
-
-    if a_due and b_due then
-      return a_due < b_due
-    elseif a_due then
-      return true
-    elseif b_due then
-      return false
-    end
-
-    -- Fall back to title
-    return (a.task.title or "") < (b.task.title or "")
-  end)
-
-  -- Build lines
+  -- Build lines: parent, then its children, then next parent...
   local lines = {}
-  for _, item in ipairs(sorted) do
-    table.insert(lines, format_task_line(item.id, item.task))
+  for _, item in ipairs(root_tasks) do
+    -- Add parent task (indent level 0)
+    table.insert(lines, format_task_line(item.id, item.task, 0))
+
+    -- Add children (indent level 1)
+    local children = children_by_parent[item.id]
+    if children then
+      for _, child in ipairs(children) do
+        table.insert(lines, format_task_line(child.id, child.task, 1))
+      end
+    end
+  end
+
+  -- Handle orphaned subtasks (parent not in current task set)
+  -- These get rendered at the end as root tasks
+  for parent_id, children in pairs(children_by_parent) do
+    local parent_found = false
+    for _, item in ipairs(root_tasks) do
+      if item.id == parent_id then
+        parent_found = true
+        break
+      end
+    end
+    if not parent_found then
+      for _, child in ipairs(children) do
+        -- Render orphans as root tasks
+        table.insert(lines, format_task_line(child.id, child.task, 0))
+      end
+    end
   end
 
   -- Update buffer
@@ -212,7 +276,7 @@ function M.render(tasks)
 end
 
 --- Apply extmarks to render the buffer nicely
---- - Conceals /ID - prefix
+--- - Conceals [indent]/ID - prefix
 --- - Renders checkbox icons over [ ] and [x]
 --- - Highlights dates
 function M.apply_extmarks()
@@ -229,10 +293,14 @@ function M.apply_extmarks()
   for i, line in ipairs(lines) do
     local row = i - 1 -- 0-indexed
 
-    -- Find the prefix pattern: /ID - [x] or /ID - [ ]
+    -- Count leading spaces (indent)
+    local leading_spaces = line:match("^(%s*)") or ""
+    local indent_len = #leading_spaces
+
+    -- Find the prefix pattern: /ID - [x] or /ID - [ ] (after indent)
     local prefix_end = line:find("%] ")
     if prefix_end then
-      -- Conceal /ID - (everything before the checkbox)
+      -- Conceal indent + /ID - (everything before the checkbox)
       local checkbox_start = line:find("%[")
       if checkbox_start and checkbox_start > 1 then
         vim.api.nvim_buf_set_extmark(buf, extmark_ns, row, 0, {
@@ -246,6 +314,12 @@ function M.apply_extmarks()
       local icon = is_checked and ICON_CHECKED or ICON_UNCHECKED
       local hl = is_checked and "DiagnosticOk" or "DiagnosticInfo"
 
+      -- For subtasks, add indent indicator before the icon
+      local icon_prefix = ""
+      if indent_len > 0 then
+        icon_prefix = "  " -- Visual indent for subtasks
+      end
+
       -- The checkbox is 3 chars: [ ] or [x]
       -- We overlay it with our icon
       if checkbox_start then
@@ -254,7 +328,7 @@ function M.apply_extmarks()
           conceal = "",
         })
         vim.api.nvim_buf_set_extmark(buf, extmark_ns, row, checkbox_start - 1, {
-          virt_text = { { icon, hl } },
+          virt_text = { { icon_prefix .. icon, hl } },
           virt_text_pos = "inline",
         })
       end
@@ -272,8 +346,8 @@ function M.apply_extmarks()
 end
 
 --- Parse all lines in the buffer and return task data
----@return table<string, table> parsed Map of ID to task data
----@return table new_tasks List of tasks without IDs (new tasks)
+---@return table<string, table> parsed Map of ID to task data (includes parent field)
+---@return table new_tasks List of tasks without IDs (new tasks, includes parent field)
 function M.parse()
   local buf = M.get_bufnr()
   if not buf then
@@ -283,14 +357,30 @@ function M.parse()
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local parsed = {}
   local new_tasks = {}
+  local current_parent_id = nil
 
   for _, line in ipairs(lines) do
-    local id, task = M.parse_line(line)
+    local id, task, indent_level = M.parse_line(line)
     if task then
-      if id then
-        parsed[id] = task
+      if indent_level == 0 then
+        -- Root task - becomes the new current parent
+        task.parent = nil
+        if id then
+          current_parent_id = id
+          parsed[id] = task
+        else
+          -- New root task - will get an ID after save
+          current_parent_id = nil
+          table.insert(new_tasks, task)
+        end
       else
-        table.insert(new_tasks, task)
+        -- Subtask (indent_level >= 1) - assign to current parent
+        task.parent = current_parent_id
+        if id then
+          parsed[id] = task
+        else
+          table.insert(new_tasks, task)
+        end
       end
     end
   end
@@ -310,18 +400,22 @@ function M.update_line(id, task)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
   for i, line in ipairs(lines) do
-    -- Extract ID: /ID - ...
-    local line_id = line:match("^/([^%s]+) %-")
+    -- Extract ID: [indent]/ID - ... (handle leading whitespace)
+    local line_id = line:match("^%s*/([^%s]+) %-")
     if line_id == id then
-      local new_line = format_task_line(id, task)
+      -- Preserve the indent level from the existing line
+      local leading_spaces = line:match("^(%s*)") or ""
+      local indent_level = math.min(math.floor(#leading_spaces / 2), 1)
+      local new_line = format_task_line(id, task, indent_level)
       vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { new_line })
       M.apply_extmarks()
       return
     end
   end
 
-  -- ID not found, append as new line
-  local new_line = format_task_line(id, task)
+  -- ID not found, append as new line (at root level, or under parent if specified)
+  local indent_level = task.parent and 1 or 0
+  local new_line = format_task_line(id, task, indent_level)
   vim.api.nvim_buf_set_lines(buf, -1, -1, false, { new_line })
   M.apply_extmarks()
 end
@@ -337,8 +431,8 @@ function M.remove_line(id)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
   for i, line in ipairs(lines) do
-    -- Extract ID: /ID - ...
-    local line_id = line:match("^/([^%s]+) %-")
+    -- Extract ID: [indent]/ID - ... (handle leading whitespace)
+    local line_id = line:match("^%s*/([^%s]+) %-")
     if line_id == id then
       vim.api.nvim_buf_set_lines(buf, i - 1, i, false, {})
       return
@@ -356,6 +450,11 @@ function M.toggle_completion()
   local cursor = vim.api.nvim_win_get_cursor(0)
   local line = vim.api.nvim_get_current_line()
 
+  -- Check if this is a valid task line (with or without indent)
+  if not line:match("^%s*/[^%s]+ %- %[[x ]%]") then
+    return -- Not a valid task line
+  end
+
   -- Toggle [ ] <-> [x]
   local new_line
   if line:match("%[%s%]") then
@@ -363,7 +462,7 @@ function M.toggle_completion()
   elseif line:match("%[x%]") then
     new_line = line:gsub("%[x%]", "[ ]", 1)
   else
-    return -- Not a valid task line
+    return -- No checkbox found
   end
 
   vim.api.nvim_buf_set_lines(buf, cursor[1] - 1, cursor[1], false, { new_line })
@@ -400,7 +499,7 @@ local function setup_autocmds(buf, on_save)
     end,
   })
 
-  -- Handle yank to strip ID prefix from lines
+  -- Handle yank to strip indent and ID prefix from lines
   vim.api.nvim_create_autocmd("TextYankPost", {
     group = augroup,
     buffer = buf,
@@ -410,13 +509,13 @@ local function setup_autocmds(buf, on_save)
         return
       end
 
-      -- Strip the /ID - prefix from each yanked line
+      -- Strip the [indent]/ID - prefix from each yanked line
       local modified = false
       local new_contents = {}
 
       for _, line in ipairs(event.regcontents) do
-        -- Remove /ID - prefix if present
-        local stripped = line:gsub("^/[^%s]+ %- ", "")
+        -- Remove leading whitespace and /ID - prefix if present
+        local stripped = line:gsub("^%s*/[^%s]+ %- ", "")
         if stripped ~= line then
           modified = true
         end

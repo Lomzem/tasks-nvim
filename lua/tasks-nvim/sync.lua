@@ -26,6 +26,8 @@ local function google_to_internal(google_task)
     hidden = false,
     hidden_at = nil,
     local_modified = nil,
+    parent = google_task.parent, -- Capture parent task ID from API
+    parent_modified = nil,
   }
 end
 
@@ -95,6 +97,7 @@ function M.fetch_and_merge(callback)
           local_task.title ~= remote_internal.title
           or local_task.status ~= remote_internal.status
           or local_task.due ~= remote_internal.due
+          or local_task.parent ~= remote_internal.parent
         then
           cache.set_task(id, remote_internal)
           changed = true
@@ -117,15 +120,31 @@ function M.fetch_and_merge(callback)
   end)
 end
 
+--- Get all tasks that have pending parent changes
+---@return table<string, table> Map of task ID to task data
+local function get_pending_parent_changes()
+  local result = {}
+  for id, task in pairs(cache.get_all_tasks()) do
+    if task.parent_modified and not cache.is_new_id(id) then
+      result[id] = task
+    end
+  end
+  return result
+end
+
 --- Push local changes to remote
 ---@param callback function|nil Called with (success, error_message) when done
 function M.push_changes(callback)
   callback = callback or function() end
 
   local pending = cache.get_pending_changes()
-  local pending_count = 0
+  local pending_parent = get_pending_parent_changes()
 
+  local pending_count = 0
   for _ in pairs(pending) do
+    pending_count = pending_count + 1
+  end
+  for _ in pairs(pending_parent) do
     pending_count = pending_count + 1
   end
 
@@ -149,10 +168,18 @@ function M.push_changes(callback)
     end
   end
 
+  -- Process content changes (create/update)
   for id, task in pairs(pending) do
     if cache.is_new_id(id) then
-      -- Create new task
-      api.create_task(task, function(success, created_task, err)
+      -- Create new task (with optional parent)
+      -- If parent is also a new:N ID, skip parent for now - will be set via move_task later
+      local parent_id = task.parent
+      if parent_id and cache.is_new_id(parent_id) then
+        parent_id = nil
+        -- Mark that we need to set parent later
+        task.parent_modified = util.now_iso8601()
+      end
+      api.create_task(task, parent_id, function(success, created_task, err)
         if success and created_task then
           -- Rename from new:N to real Google ID
           cache.rename_id(id, created_task.id)
@@ -162,6 +189,8 @@ function M.push_changes(callback)
           if updated_task then
             updated_task.updated = created_task.updated
             updated_task.local_modified = nil
+            -- Parent was set during creation, so clear parent_modified if set
+            updated_task.parent_modified = nil
           end
 
           -- Update buffer if open
@@ -198,12 +227,33 @@ function M.push_changes(callback)
       end)
     end
   end
+
+  -- Process parent changes (move tasks)
+  for id, task in pairs(pending_parent) do
+    -- Skip if this task was also in pending (already handled above as new task)
+    if not pending[id] then
+      api.move_task(id, { parent = task.parent }, function(success, _, err)
+        if success then
+          cache.clear_parent_modified(id)
+        else
+          table.insert(errors, "Failed to move task: " .. (err or "unknown"))
+        end
+
+        completed = completed + 1
+        check_done()
+      end)
+    else
+      -- Task was in both pending and pending_parent, decrement count since we're skipping
+      completed = completed + 1
+      check_done()
+    end
+  end
 end
 
 --- Handle buffer save: parse changes, update cache, push to remote
 function M.on_buffer_save()
   local parsed, new_tasks = buffer.parse()
-  
+
   -- IMPORTANT: Take a snapshot of current cache IDs before modifying
   -- We need this because cache.get_all_tasks() returns a reference
   local existing_ids = {}
@@ -228,17 +278,34 @@ function M.on_buffer_save()
       -- Treat as new task (strip the ID)
       table.insert(new_tasks, buffer_task)
     else
-      -- Check if task was modified
-      if
-        cached_task.title ~= buffer_task.title
+      -- Check if task was modified (including parent)
+      local content_changed = cached_task.title ~= buffer_task.title
         or cached_task.status ~= buffer_task.status
         or cached_task.due ~= buffer_task.due
-      then
+
+      local parent_changed = cached_task.parent ~= buffer_task.parent
+
+      if content_changed then
         -- Update cache with changes
         cached_task.title = buffer_task.title
         cached_task.status = buffer_task.status
         cached_task.due = buffer_task.due
         cached_task.local_modified = util.now_iso8601()
+      end
+
+      if parent_changed then
+        -- Warn if trying to indent a task that has children (would create > 1 level nesting)
+        if buffer_task.parent and cache.has_children(id) then
+          vim.notify(
+            "tasks-nvim: Cannot indent task with children (only 1 level of nesting supported)",
+            vim.log.levels.WARN
+          )
+          -- Don't update parent, keep it as root
+        else
+          -- Update parent and mark parent_modified
+          cached_task.parent = buffer_task.parent
+          cached_task.parent_modified = util.now_iso8601()
+        end
       end
     end
   end
@@ -254,6 +321,8 @@ function M.on_buffer_save()
       hidden = false,
       hidden_at = nil,
       local_modified = util.now_iso8601(),
+      parent = task.parent,
+      parent_modified = nil,
     })
   end
 
@@ -263,6 +332,13 @@ function M.on_buffer_save()
     local task = cache.get_task(id)
     if task and not task.hidden and not seen_ids[id] then
       -- Task was deleted from buffer
+      -- Promote orphaned children to root level
+      local children = cache.get_children(id)
+      for child_id, child_task in pairs(children) do
+        child_task.parent = nil
+        child_task.parent_modified = util.now_iso8601()
+      end
+
       if cache.is_new_id(id) then
         -- New task that was never synced, just remove from cache
         cache.delete_task(id)

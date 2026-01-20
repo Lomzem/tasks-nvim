@@ -154,6 +154,13 @@ function M.rename_id(old_id, new_id)
   if task then
     cache.tasks[new_id] = task
     cache.tasks[old_id] = nil
+
+    -- Update parent references in child tasks
+    for _, child_task in pairs(cache.tasks) do
+      if child_task.parent == old_id then
+        child_task.parent = new_id
+      end
+    end
   end
 end
 
@@ -206,6 +213,52 @@ function M.get_hidden_tasks()
     end
   end
   return result
+end
+
+--- Get all children of a parent task
+---@param parent_id string Parent task ID
+---@return table<string, table> Map of child task ID to task data
+function M.get_children(parent_id)
+  local result = {}
+  for id, task in pairs(cache.tasks) do
+    if task.parent == parent_id and not task.hidden then
+      result[id] = task
+    end
+  end
+  return result
+end
+
+--- Check if a task has children
+---@param id string Task ID
+---@return boolean True if the task has at least one child
+function M.has_children(id)
+  for _, task in pairs(cache.tasks) do
+    if task.parent == id and not task.hidden then
+      return true
+    end
+  end
+  return false
+end
+
+--- Get all root tasks (tasks with no parent)
+---@return table<string, table> Map of task ID to task data
+function M.get_root_tasks()
+  local result = {}
+  for id, task in pairs(cache.tasks) do
+    if not task.parent and not task.hidden then
+      result[id] = task
+    end
+  end
+  return result
+end
+
+--- Clear the parent_modified flag for a task
+---@param id string Task ID
+function M.clear_parent_modified(id)
+  local task = cache.tasks[id]
+  if task then
+    task.parent_modified = nil
+  end
 end
 
 return M

@@ -132,8 +132,9 @@ end
 
 --- Create a new task
 ---@param task table Task data (title, due, status, etc.)
+---@param parent_id string|nil Parent task ID (for creating subtasks)
 ---@param callback function Called with (success, created_task, error_message)
-function M.create_task(task, callback)
+function M.create_task(task, parent_id, callback)
   local body = {
     title = task.title,
     status = task.status or "needsAction",
@@ -149,7 +150,12 @@ function M.create_task(task, callback)
     end
   end
 
-  api_request("post", "/lists/" .. DEFAULT_TASKLIST .. "/tasks", { body = body }, callback)
+  local query = {}
+  if parent_id then
+    query.parent = parent_id
+  end
+
+  api_request("post", "/lists/" .. DEFAULT_TASKLIST .. "/tasks", { body = body, query = query }, callback)
 end
 
 --- Update an existing task
@@ -192,14 +198,20 @@ function M.get_task(id, callback)
   api_request("get", "/lists/" .. DEFAULT_TASKLIST .. "/tasks/" .. id, {}, callback)
 end
 
---- Move a task (change its position in the list)
+--- Move a task (change its position and/or parent in the list)
 ---@param id string Google Task ID
----@param previous_id string|nil ID of the task to place after (nil for first)
+---@param opts table Options: { parent = string|nil, previous = string|nil }
 ---@param callback function Called with (success, task, error_message)
-function M.move_task(id, previous_id, callback)
+function M.move_task(id, opts, callback)
+  opts = opts or {}
   local query = {}
-  if previous_id then
-    query.previous = previous_id
+
+  if opts.parent then
+    query.parent = opts.parent
+  end
+
+  if opts.previous then
+    query.previous = opts.previous
   end
 
   api_request("post", "/lists/" .. DEFAULT_TASKLIST .. "/tasks/" .. id .. "/move", { query = query }, callback)
